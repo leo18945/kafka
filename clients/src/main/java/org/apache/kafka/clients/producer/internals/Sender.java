@@ -330,12 +330,29 @@ public class Sender implements Runnable {
         client.poll(pollTimeout, currentTimeMs);
     }
 
-    // 发送生产者消息
+    /**
+     * 发送消息
+     *
+     * 1.获取哪些 partition 的 batch 可以发送了
+     * 2.有哪些 partition 对应的 metadata 没拉取到的，标注下以便后继拉取
+     * 3.删除没准备好的 node
+     * 4.准备发送数据：合并同一 node 的不同 partition 的 batch
+     * 5.判断 batch 在内存缓冲区中停留是否超时，是就不要了
+     * 6.准备返回值
+     * 7.发送 ProduceRequest 网络请求
+     *
+     * @param now
+     * @return
+     */
     private long sendProducerData(long now) {
         Cluster cluster = metadata.fetch();
+        // 1.获取哪些 partition 的 batch 可以发送了
+        // batch 发送条件： batch.size or linger.ms
+        // 要收集 partition 对应的 leader replica 所在的 broker 信息
         // get the list of partitions with data ready to send
         RecordAccumulator.ReadyCheckResult result = this.accumulator.ready(cluster, now);
 
+        // 2.有哪些 partition 对应的 metadata 没拉取到的，标注下以便后继拉取
         // if there are any partitions whose leaders are not known yet, force metadata update
         if (!result.unknownLeaderTopics.isEmpty()) {
             // The set of topics with unknown leader contains topics with leader election pending as well as
@@ -349,6 +366,7 @@ public class Sender implements Runnable {
             this.metadata.requestUpdate();
         }
 
+        // 3.删除没准备好的 node
         // remove any nodes we aren't ready to send to
         Iterator<Node> iter = result.readyNodes.iterator();
         long notReadyTimeout = Long.MAX_VALUE;
@@ -360,6 +378,8 @@ public class Sender implements Runnable {
             }
         }
 
+        // 4.准备发送数据
+        // 为了提高性能减少 TCP 请求，所以 按 broker id 给 partition 分组，找到一个 broker 对应的多个 partition ，把数据汇总后发送
         // create produce requests
         Map<Integer, List<ProducerBatch>> batches = this.accumulator.drain(cluster, result.readyNodes, this.maxRequestSize, now);
         addToInflightBatches(batches);
@@ -371,6 +391,8 @@ public class Sender implements Runnable {
             }
         }
 
+        // 5.判断 batch 在内存缓冲区中停留是否超时，是就不要了
+        // 超时时长判定参数：delivery.timeout.ms
         accumulator.resetNextBatchExpiryTime();
         List<ProducerBatch> expiredInflightBatches = getExpiredInflightBatches(now);
         List<ProducerBatch> expiredBatches = this.accumulator.expiredBatches(now);
@@ -392,6 +414,7 @@ public class Sender implements Runnable {
         }
         sensors.updateProduceRequestMetrics(batches);
 
+        // 6.准备返回值
         // If we have any nodes that are ready to send + have sendable data, poll with 0 timeout so this can immediately
         // loop and try sending more data. Otherwise, the timeout will be the smaller value between next batch expiry
         // time, and the delay time for checking data availability. Note that the nodes may have data that isn't yet
@@ -408,6 +431,9 @@ public class Sender implements Runnable {
             // otherwise the select time will be the time difference between now and the metadata expiry time;
             pollTimeout = 0;
         }
+
+        // 7.发送 ProduceRequest 网络请求
+        // 一个 broker 创建一个 ClientRequest，这个 ClientRequest 有可能包含多个 partition 的数据，一个 partition包含多个batch，所有数据聚合形成一个数据包后发送到 broker
         sendProduceRequests(batches, now);
         return pollTimeout;
     }
@@ -839,9 +865,9 @@ public class Sender implements Runnable {
         RequestCompletionHandler callback = response -> handleProduceResponse(response, recordsByPartition, time.milliseconds());
 
         String nodeId = Integer.toString(destination);
-        ClientRequest clientRequest = client.newClientRequest(nodeId, requestBuilder, now, acks != 0,
-                requestTimeoutMs, callback);
-        client.send(clientRequest, now);
+        // 构建 ClientRequest 数据结构
+        ClientRequest clientRequest = client.newClientRequest(nodeId, requestBuilder, now, acks != 0, requestTimeoutMs, callback);
+        client.send(clientRequest, now); // 发送 tcp 请求
         log.trace("Sent produce request to {}: {}", nodeId, requestBuilder);
     }
 

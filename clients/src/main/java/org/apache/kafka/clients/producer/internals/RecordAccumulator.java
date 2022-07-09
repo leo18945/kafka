@@ -445,6 +445,7 @@ public class RecordAccumulator {
         long nextReadyCheckDelayMs = Long.MAX_VALUE;
         Set<String> unknownLeaderTopics = new HashSet<>();
 
+        // exhausted 表示内存是否耗尽，有线程在等待申请内存(this.free.queued() > 0)
         boolean exhausted = this.free.queued() > 0;
         for (Map.Entry<TopicPartition, Deque<ProducerBatch>> entry : this.batches.entrySet()) {
             Deque<ProducerBatch> deque = entry.getValue();
@@ -460,37 +461,38 @@ public class RecordAccumulator {
             // synchronized block, as this lock is also used to synchronize producer threads
             // attempting to append() to a partition/batch.
 
-            synchronized (deque) {
+            synchronized (deque) { // 这里加锁防止另一个线程也进入处理
                 // Deques are often empty in this path, esp with large partition counts,
                 // so we exit early if we can.
                 batch = deque.peekFirst();
                 if (batch == null) {
-                    continue;
+                    continue; // batch 为空就返回
                 }
 
-                waitedTimeMs = batch.waitedTimeMs(nowMs);
-                backingOff = batch.attempts() > 0 && waitedTimeMs < retryBackoffMs;
-                full = deque.size() > 1 || batch.isFull();
+                waitedTimeMs = batch.waitedTimeMs(nowMs); // batch 已经等了多久，用now减去最近一次的发送时间，就是等待时间
+                backingOff = batch.attempts() > 0 && waitedTimeMs < retryBackoffMs; // 判断是否要继续等待，如果不是第一次发送，而且等待时间小于配置的retryBackoffMs，说明还没等够要继续等，否则就发送
+                full = deque.size() > 1 || batch.isFull(); // 判断 batch | deque 是否已经满了
             }
 
-            TopicPartition part = entry.getKey();
-            Node leader = cluster.leaderFor(part);
+            TopicPartition part = entry.getKey();  // 取出分区信息
+            Node leader = cluster.leaderFor(part); // 取出某个 partition 的 leader replica 所在的 node
             if (leader == null) {
                 // This is a partition for which leader is not known, but messages are available to send.
                 // Note that entries are currently not removed from batches when deque is empty.
                 unknownLeaderTopics.add(part.topic());
             } else if (!readyNodes.contains(leader) && !isMuted(part)) {
-                long timeToWaitMs = backingOff ? retryBackoffMs : lingerMs;
-                boolean expired = waitedTimeMs >= timeToWaitMs;
-                boolean transactionCompleting = transactionManager != null && transactionManager.isCompleting();
-                boolean sendable = full
-                    || expired
-                    || exhausted
+                long timeToWaitMs = backingOff ? retryBackoffMs : lingerMs; // batch 必须等待时间，1.是否达到重试间隔，2.是否达到linger时间，必须过了这两个时间batch才能发送
+                boolean expired = waitedTimeMs >= timeToWaitMs; // batch 是否达到各种等待时间，是则可以发送
+                boolean transactionCompleting = transactionManager != null && transactionManager.isCompleting(); // 事务是否完成
+                // sendable 变量用于综合判断 batch 是否可以发送了，多个条件中任意一个满足即可
+                boolean sendable = full // deque 队列是否已满，满了就可以发
+                    || expired // batch 是否达到各种等待时间，是则可以发送
+                    || exhausted // 内存是否耗尽，耗尽也可以发送
                     || closed
                     || flushInProgress()
-                    || transactionCompleting;
-                if (sendable && !backingOff) {
-                    readyNodes.add(leader);
+                    || transactionCompleting; // 事务是否完成，完成也可以发送
+                if (sendable && !backingOff) { // 满足以上发送条件，且不满足backingOff条件
+                    readyNodes.add(leader);    // 就把 leader replica 所属的 node 加入[已准备好] set 中，表示对这些node发送消息
                 } else {
                     long timeLeftMs = Math.max(timeToWaitMs - waitedTimeMs, 0);
                     // Note that this results in a conservative estimate since an un-sendable partition may have
@@ -654,6 +656,8 @@ public class RecordAccumulator {
 
         Map<Integer, List<ProducerBatch>> batches = new HashMap<>();
         for (Node node : nodes) {
+            // 合并同一 node 的不同 partition 的 batch
+            // 为了提高性能，减少 tcp 请求数量
             List<ProducerBatch> ready = drainBatchesForOneNode(cluster, node, maxSize, now);
             batches.put(node.id(), ready);
         }
