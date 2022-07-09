@@ -324,10 +324,13 @@ public class Sender implements Runnable {
         }
 
         long currentTimeMs = time.milliseconds();
+
+        // 这里开始发送消息
         long pollTimeout = sendProducerData(currentTimeMs);
         client.poll(pollTimeout, currentTimeMs);
     }
 
+    // 发送生产者消息
     private long sendProducerData(long now) {
         Cluster cluster = metadata.fetch();
         // get the list of partitions with data ready to send
