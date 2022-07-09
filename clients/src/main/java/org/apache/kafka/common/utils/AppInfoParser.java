@@ -60,7 +60,7 @@ public class AppInfoParser {
     public static synchronized void registerAppInfo(String prefix, String id, Metrics metrics, long nowMs) {
         try {
             ObjectName name = new ObjectName(prefix + ":type=app-info,id=" + Sanitizer.jmxSanitize(id));
-            AppInfo mBean = new AppInfo(nowMs);
+            AppInfo mBean = new AppInfo(nowMs); // 打印 kafka 版本相关信息
             ManagementFactory.getPlatformMBeanServer().registerMBean(mBean, name);
 
             registerMetrics(metrics, mBean); // prefix will be added later by JmxReporter

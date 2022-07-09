@@ -463,34 +463,45 @@ public final class RecordAccumulator {
         long nextReadyCheckDelayMs = Long.MAX_VALUE;
         Set<String> unknownLeaderTopics = new HashSet<>();
 
+        // exhausted 表示内存是否耗尽，有线程在等待申请内存(this.free.queued() > 0)
         boolean exhausted = this.free.queued() > 0;
         for (Map.Entry<TopicPartition, Deque<ProducerBatch>> entry : this.batches.entrySet()) {
             Deque<ProducerBatch> deque = entry.getValue();
-            synchronized (deque) {
+            synchronized (deque) { // 这里加锁防止另一个线程也进入处理
                 // When producing to a large number of partitions, this path is hot and deques are often empty.
                 // We check whether a batch exists first to avoid the more expensive checks whenever possible.
+                // 为什么只拿 first-batch 来判断是否符合发送条件？而不是在 Deque 只取所有的 batch 出来判断？
+                // 分析：把 batch 加入到 Deque 时用 dq.addLast(batch);
+                //      而在 ready 方法中，判断 batch 是否符合发送条件，是用 deque.peekFirst() 拿 batch 来判断
+                // deque.peekFirst() 其实拿的是最早放入的那一条而不是最后放入的那一条，所以说最早放入的那一条等的时间够久啦，只要这条符合发送条件就可以发送
                 ProducerBatch batch = deque.peekFirst();
                 if (batch != null) {
-                    TopicPartition part = entry.getKey();
-                    Node leader = cluster.leaderFor(part);
-                    if (leader == null) {
+                    TopicPartition part = entry.getKey();  // 取出分区信息
+                    Node leader = cluster.leaderFor(part); // 取出某个 partition 的 leader replica 所在的 node
+                    if (leader == null) { //没查到 leader 信息，则把这个分区加到未知leader集合中
                         // This is a partition for which leader is not known, but messages are available to send.
                         // Note that entries are currently not removed from batches when deque is empty.
                         unknownLeaderTopics.add(part.topic());
-                    } else if (!readyNodes.contains(leader) && !isMuted(part, nowMs)) {
-                        long waitedTimeMs = batch.waitedTimeMs(nowMs);
-                        boolean backingOff = batch.attempts() > 0 && waitedTimeMs < retryBackoffMs;
-                        long timeToWaitMs = backingOff ? retryBackoffMs : lingerMs;
-                        boolean full = deque.size() > 1 || batch.isFull();
-                        boolean expired = waitedTimeMs >= timeToWaitMs;
+                    } else if (!readyNodes.contains(leader) && !isMuted(part, nowMs)) { // 如果查到 leader 信息
+                        long waitedTimeMs = batch.waitedTimeMs(nowMs);  // batch 已经等了多久，用now减去最近一次的发送时间，就是等待时间
+                        boolean backingOff = batch.attempts() > 0 && waitedTimeMs < retryBackoffMs; // 判断是否要继续等待，如果不是第一次发送，而且等待时间小于配置的retryBackoffMs，说明还没等够要继续等，否则就发送
+                        long timeToWaitMs = backingOff ? retryBackoffMs : lingerMs; // batch 必须等待时间，1.是否达到重试间隔，2.是否达到linger时间，必须过了这两个时间batch才能发送
+                        boolean full = deque.size() > 1 || batch.isFull(); // 判断 batch | deque 是否已经满了
+                        boolean expired = waitedTimeMs >= timeToWaitMs; // batch 是否达到各种等待时间，是则可以发送
+                        // sendable 变量用于综合判断 batch 是否可以发送了，多个条件中任意一个满足即可
+                        // closed - 当调用 KafkaProducer.close() 方法时，最终会把本类的 closed 变量设置为 true
+                        //   调用链：KafkaProducer.close() -> this.sender.forceClose() -> this.initiateClose() -> this.accumulator.close() -> this.closed = true
+                        // flushInProgress() -> flush 就是把数据从缓冲区 flush 到网络，真正的发送
                         boolean sendable = full || expired || exhausted || closed || flushInProgress();
-                        if (sendable && !backingOff) {
-                            readyNodes.add(leader);
-                        } else {
+                        if (sendable && !backingOff) { // 满足以上发送条件，且不满足backingOff条件
+                            readyNodes.add(leader); // 把 leader replica 所属的 node 加入[已准备好] set 中，表示对这些node发送消息
+                        } else { // 不满足发送时间就不能发，则更新下一次检查时间，简单点说就是还没到需要等待的时间
+                            // 下一次检查时间 = 配置需要间隔的时间 - 已经等待的时间
                             long timeLeftMs = Math.max(timeToWaitMs - waitedTimeMs, 0);
                             // Note that this results in a conservative estimate since an un-sendable partition may have
                             // a leader that will later be found to have sendable data. However, this is good enough
                             // since we'll just wake up and then sleep again for the remaining time.
+                            // nextReadyCheckDelayMs - 会在多个 partition 之间，取最小的那一个时间做为下一次检查的间隔时间，因为是通过 for 循环后取 min 值
                             nextReadyCheckDelayMs = Math.min(timeLeftMs, nextReadyCheckDelayMs);
                         }
                     }
@@ -643,6 +654,8 @@ public final class RecordAccumulator {
 
         Map<Integer, List<ProducerBatch>> batches = new HashMap<>();
         for (Node node : nodes) {
+            // 合并同一 node 的不同 partition 的 batch
+            // 为了提高性能，减少 tcp 请求数量
             List<ProducerBatch> ready = drainBatchesForOneNode(cluster, node, maxSize, now);
             batches.put(node.id(), ready);
         }

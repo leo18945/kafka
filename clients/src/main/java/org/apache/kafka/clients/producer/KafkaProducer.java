@@ -353,6 +353,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                     Collections.singletonMap(ProducerConfig.CLIENT_ID_CONFIG, clientId));
             reporters.add(new JmxReporter(JMX_PREFIX));
             this.metrics = new Metrics(metricConfig, reporters, time);
+            // 设置分区器，默认为 DefaultPartitioner
             this.partitioner = config.getConfiguredInstance(ProducerConfig.PARTITIONER_CLASS_CONFIG, Partitioner.class);
             long retryBackoffMs = config.getLong(ProducerConfig.RETRY_BACKOFF_MS_CONFIG);
             if (keySerializer == null) {
@@ -377,10 +378,13 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             ProducerConfig configWithClientId = new ProducerConfig(userProvidedConfigs, false);
             List<ProducerInterceptor<K, V>> interceptorList = (List) configWithClientId.getConfiguredInstances(
                     ProducerConfig.INTERCEPTOR_CLASSES_CONFIG, ProducerInterceptor.class);
+
+            // 设置 interceptors
             if (interceptors != null)
                 this.interceptors = interceptors;
             else
                 this.interceptors = new ProducerInterceptors<>(interceptorList);
+
             ClusterResourceListeners clusterResourceListeners = configureClusterResourceListeners(keySerializer,
                     valueSerializer, interceptorList, reporters);
             this.maxRequestSize = config.getInt(ProducerConfig.MAX_REQUEST_SIZE_CONFIG);
@@ -392,6 +396,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
 
             this.apiVersions = new ApiVersions();
             this.transactionManager = configureTransactionState(config, logContext);
+            // 构建 [消息缓冲区对象]
             this.accumulator = new RecordAccumulator(logContext,
                     config.getInt(ProducerConfig.BATCH_SIZE_CONFIG),
                     this.compressionType,
@@ -405,6 +410,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                     transactionManager,
                     new BufferPool(this.totalMemorySize, config.getInt(ProducerConfig.BATCH_SIZE_CONFIG), metrics, time, PRODUCER_METRIC_GROUP_NAME));
 
+            // 解析 broker 地址，用于查询 metadata 信息
             List<InetSocketAddress> addresses = ClientUtils.parseAndValidateAddresses(
                     config.getList(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG),
                     config.getString(ProducerConfig.CLIENT_DNS_LOOKUP_CONFIG));
@@ -420,10 +426,12 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                 this.metadata.bootstrap(addresses);
             }
             this.errors = this.metrics.sensor("errors");
+
+            // 构建 sender 对象，发送消息线程
             this.sender = newSender(logContext, kafkaClient, this.metadata);
             String ioThreadName = NETWORK_THREAD_PREFIX + " | " + clientId;
             this.ioThread = new KafkaThread(ioThreadName, this.sender, true);
-            this.ioThread.start();
+            this.ioThread.start(); // 启动 sender 线程
             config.logUnused();
             AppInfoParser.registerAppInfo(JMX_PREFIX, clientId, metrics, time.milliseconds());
             log.debug("Kafka producer started");
@@ -880,6 +888,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             long nowMs = time.milliseconds();
             ClusterAndWaitTime clusterAndWaitTime;
             try {
+                // 等待拉取 metadata，只有有了 metadata 才知道消息要发到哪个 broker
                 clusterAndWaitTime = waitOnMetadata(record.topic(), record.partition(), nowMs, maxBlockTimeMs);
             } catch (KafkaException e) {
                 if (metadata.isClosed())
@@ -890,7 +899,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             long remainingWaitMs = Math.max(0, maxBlockTimeMs - clusterAndWaitTime.waitedOnMetadataMs);
             Cluster cluster = clusterAndWaitTime.cluster;
             byte[] serializedKey;
-            try {
+            try { // 序列化 key, 也就是把 key 对象转化成 byte[]，便于后继发送 tcp 请求
                 serializedKey = keySerializer.serialize(record.topic(), record.headers(), record.key());
             } catch (ClassCastException cce) {
                 throw new SerializationException("Can't convert key of class " + record.key().getClass().getName() +
@@ -898,32 +907,38 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                         " specified in key.serializer", cce);
             }
             byte[] serializedValue;
-            try {
+            try { // 序列化 value, 也就是把 value 对象转化成 byte[]，便于后继发送 tcp 请求
                 serializedValue = valueSerializer.serialize(record.topic(), record.headers(), record.value());
             } catch (ClassCastException cce) {
                 throw new SerializationException("Can't convert value of class " + record.value().getClass().getName() +
                         " to class " + producerConfig.getClass(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG).getName() +
                         " specified in value.serializer", cce);
             }
+            // 对消息进行分区
             int partition = partition(record, serializedKey, serializedValue, cluster);
             tp = new TopicPartition(record.topic(), partition);
 
             setReadOnly(record.headers());
             Header[] headers = record.headers().toArray();
 
+            // 计算 [整个消息大小]
             int serializedSize = AbstractRecords.estimateSizeInBytesUpperBound(apiVersions.maxUsableProduceMagic(),
                     compressionType, serializedKey, serializedValue, headers);
+            // 判断消息大小是否超限，判断标准：消息大小是否超过 maxRequestSize | totalMemorySize
             ensureValidRecordSize(serializedSize);
+
             long timestamp = record.timestamp() == null ? nowMs : record.timestamp();
             if (log.isTraceEnabled()) {
                 log.trace("Attempting to append record {} with callback {} to topic {} partition {}", record, callback, record.topic(), partition);
             }
+            // 构建 callback & interceptors，用于发送前和 kafka server ack 时的相应处理逻辑
             // producer callback will make sure to call both 'callback' and interceptor callback
             Callback interceptCallback = new InterceptorCallback<>(callback, this.interceptors, tp);
 
             if (transactionManager != null && transactionManager.isTransactional()) {
                 transactionManager.failIfNotReadyForSend();
             }
+            // 把消息添加到内存缓冲区
             RecordAccumulator.RecordAppendResult result = accumulator.append(tp, timestamp, serializedKey,
                     serializedValue, headers, interceptCallback, remainingWaitMs, true, nowMs);
 
@@ -947,7 +962,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
 
             if (result.batchIsFull || result.newBatchCreated) {
                 log.trace("Waking up the sender since topic {} partition {} is either full or getting a new batch", record.topic(), partition);
-                this.sender.wakeup();
+                this.sender.wakeup(); // 唤醒 sender 线程
             }
             return result.future;
             // handling exceptions and record the errors;
