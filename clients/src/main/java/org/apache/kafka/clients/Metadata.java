@@ -60,7 +60,7 @@ import static org.apache.kafka.common.record.RecordBatch.NO_PARTITION_LEADER_EPO
 public class Metadata implements Closeable {
     private final Logger log;
     private final long refreshBackoffMs;
-    private final long metadataExpireMs;
+    private final long metadataExpireMs; // metadataExpireMs = metadata.max.age.ms
     private int updateVersion;  // bumped on every metadata response
     private int requestVersion; // bumped on every new topic addition
     private long lastRefreshMs;
@@ -118,6 +118,7 @@ public class Metadata implements Closeable {
      * @return remaining time in ms till the cluster info can be updated again
      */
     public synchronized long timeToAllowUpdate(long nowMs) {
+        // refreshBackoffMs = retryBackoffMs = retry.backoff.ms
         return Math.max(this.lastRefreshMs + this.refreshBackoffMs - nowMs, 0);
     }
 
@@ -125,12 +126,16 @@ public class Metadata implements Closeable {
      * The next time to update the cluster info is the maximum of the time the current info will expire and the time the
      * current info can be updated (i.e. backoff time has elapsed); If an update has been request then the expiry time
      * is now
+     * 还要等多久才会执行下一次更新元数据metadata
      *
      * @param nowMs current time in ms
      * @return remaining time in ms till updating the cluster info
      */
     public synchronized long timeToNextUpdate(long nowMs) {
+        // timeToExpire-元数据还要等多久就会过期
+        // 算法：最后一次成功更新的时间 + metadata.max.age.ms - 当前时间
         long timeToExpire = updateRequested() ? 0 : Math.max(this.lastSuccessfulRefreshMs + this.metadataExpireMs - nowMs, 0);
+        // timeToAllowUpdate 按配置要求(retry.backoff.ms)，还要等多久才能执行下一次更新
         return Math.max(timeToExpire, timeToAllowUpdate(nowMs));
     }
 

@@ -361,6 +361,8 @@ public class Sender implements Runnable {
 
             log.debug("Requesting metadata update due to unknown leader topics from the batched records: {}",
                 result.unknownLeaderTopics);
+
+            // 对 partition leader node 未知的，要标注，以便后续根据这个标注进行更新
             this.metadata.requestUpdate();
         }
 
@@ -370,6 +372,8 @@ public class Sender implements Runnable {
         long notReadyTimeout = Long.MAX_VALUE;
         while (iter.hasNext()) {
             Node node = iter.next();
+            // 连接还没准备好，就要删除
+            // 1.当前不能处于元数据加载的过程，如果马上就要更新元数据 或者正在更新元数据，就不能发送业务请求
             if (!this.client.ready(node, now)) {
                 iter.remove();
                 notReadyTimeout = Math.min(notReadyTimeout, this.client.pollDelayMs(node, now));
